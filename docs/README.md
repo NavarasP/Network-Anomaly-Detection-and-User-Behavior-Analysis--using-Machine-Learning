@@ -9,7 +9,7 @@ Backend (FastAPI)
   python -m venv .venv
   .venv\Scripts\Activate.ps1
   pip install -r backend/requirements.txt
-  uvicorn backend.main:app --reload --port 8000
+  uvicorn main:app --reload --port 8000
 
 Frontend (Next.js)
 - entry: frontend/pages/index.js
