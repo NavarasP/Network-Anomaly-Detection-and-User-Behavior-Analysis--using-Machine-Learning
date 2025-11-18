@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Node
+frontend/node_modules/
+.next/
+
+# Jupyter
+.ipynb_checkpoints/
+Product_Backlog-1
+data
