@@ -1,0 +1,343 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import joblib
+import numpy as np
+import pandas as pd
+import os
+from typing import List, Optional, Dict
+from datetime import datetime
+import asyncio
+import json
+from fastapi.responses import StreamingResponse
+import time
+
+
+app = FastAPI(title="Anomaly Detection API")
+
+MODEL_DIR_CANDIDATES = [
+    os.path.join(os.getcwd(), "models"),
+    os.path.join(os.getcwd(), "backend", "models"),
+    "/data/models",
+]
+
+LOG_FILE = os.path.join(os.path.dirname(__file__), "network.log")
+
+model = None
+scaler_net = None
+scaler_user = None
+pca = None
+
+# In-memory ring buffer for recent events
+RECENT_EVENTS: list = []
+RECENT_EVENTS_MAX = 500
+
+class Features(BaseModel):
+    network: List[float]
+    user: List[float]
+
+
+def _find_and_load(path):
+    try:
+        return joblib.load(path)
+    except Exception:
+        return None
+
+
+def load_models():
+    global model, scaler_net, scaler_user, pca
+
+    model_dir = None
+    for base in MODEL_DIR_CANDIDATES:
+        if os.path.exists(os.path.join(base, "scaler_nslkdd.joblib")):
+            model_dir = base
+            break
+
+    if model_dir is None:
+        print("❌ No model directory found")
+        return
+
+    print(f"📦 Loading models from: {model_dir}")
+
+    # load your components
+    scaler_net = joblib.load(os.path.join(model_dir, "scaler_nslkdd.joblib"))
+    encoder = tf.keras.models.load_model(os.path.join(model_dir, "stacked_encoder.keras"))
+    model = joblib.load(os.path.join(model_dir, "rf_encoded.joblib"))
+
+    scaler_user = None      # your model does not separate user scaler
+    pca = None              # no PCA used
+
+    print("✅ Models loaded!")
+
+
+
+@app.on_event("startup")
+def startup_event():
+    load_models()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": model is not None}
+
+
+@app.post("/score")
+def score(features: Features):
+    if model is None or scaler_net is None or scaler_user is None:
+        raise HTTPException(status_code=503, detail="Model or scalers not available on server")
+
+    # Combine network + user features EXACTLY like training
+    # Your model uses ONE unified vector after encoding
+    net = np.array(features.network).reshape(1, -1)
+    user = np.array(features.user).reshape(1, -1)
+
+    # Combine before scaling
+    x = np.hstack([net, user])
+
+    try:
+        x_scaled = scaler_net.transform(x)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Scaling failed: {e}")
+
+    # encode with stacked NDAE
+    code = encoder.predict(x_scaled)
+
+    # predict probability
+    try:
+        prob = float(model.predict_proba(code)[:, 1][0])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {e}")
+
+    return {"score": prob}
+
+
+
+# Legacy mock event generator removed; now using real log tailer
+
+
+def _push_event(ev: dict):
+    """Push event into in-memory ring buffer."""
+    RECENT_EVENTS.insert(0, ev)
+    if len(RECENT_EVENTS) > RECENT_EVENTS_MAX:
+        RECENT_EVENTS.pop()
+
+
+def parse_log_line(line: str) -> Optional[Dict]:
+    """Parse a CSV log line into a dict with all expected fields.
+    Expected columns:
+    timestamp,user_id,duration,src_bytes,dst_bytes,wrong_fragment,urgent,count_same_dst,srv_count,protocol_type,service,flag,login_hour,avg_login_hour,device_count,new_device_flag,sensitive_access,src_ip,dst_ip
+    """
+    try:
+        parts = line.strip().split(',')
+        if len(parts) < 17:
+            return None
+        return {
+            "timestamp": parts[0],
+            "user_id": parts[1],
+            "duration": float(parts[2]),
+            "src_bytes": float(parts[3]),
+            "dst_bytes": float(parts[4]),
+            "wrong_fragment": int(parts[5]),
+            "urgent": int(parts[6]),
+            "count_same_dst": int(parts[7]),
+            "srv_count": int(parts[8]),
+            "protocol_type": int(parts[9]),
+            "service": int(parts[10]),
+            "flag": int(parts[11]),
+            "login_hour": float(parts[12]),
+            "avg_login_hour": float(parts[13]),
+            "device_count": int(parts[14]),
+            "new_device_flag": int(parts[15]),
+            "sensitive_access": int(parts[16]),
+            "src_ip": parts[17] if len(parts) > 17 else "unknown",
+            "dst_ip": parts[18] if len(parts) > 18 else "unknown",
+        }
+    except Exception as e:
+        print(f"Failed to parse log line: {e}")
+        return None
+
+
+def extract_features(log_dict: Dict) -> tuple:
+    """Extract network and user feature vectors from parsed log.
+    Returns (network_features, user_features) as numpy arrays.
+    Network features need one-hot encoding for protocol_type, service, flag.
+    """
+    # Base network features
+    net_base = [
+        log_dict["duration"],
+        log_dict["src_bytes"],
+        log_dict["dst_bytes"],
+        log_dict["wrong_fragment"],
+        log_dict["urgent"],
+        log_dict["count_same_dst"],
+        log_dict["srv_count"],
+    ]
+    # One-hot encode categorical: protocol_type (0-2), service (0-9), flag (0-5)
+    proto_oh = [0.0] * 3
+    proto_oh[log_dict["protocol_type"]] = 1.0
+    svc_oh = [0.0] * 10
+    svc_oh[log_dict["service"]] = 1.0
+    flag_oh = [0.0] * 6
+    flag_oh[log_dict["flag"]] = 1.0
+    
+    net_features = np.array(net_base + proto_oh + svc_oh + flag_oh, dtype=np.float32)
+    
+    # User features
+    user_features = np.array([
+        log_dict["login_hour"],
+        log_dict["avg_login_hour"],
+        log_dict["device_count"],
+        log_dict["new_device_flag"],
+        log_dict["sensitive_access"],
+    ], dtype=np.float32)
+    
+    return net_features, user_features
+
+
+def score_log_with_explainability(log_dict: Dict) -> Optional[Dict]:
+    """Score a parsed log dict and return prediction + explainability."""
+    if model is None or scaler_net is None or scaler_user is None:
+        return None
+    
+    try:
+        net, user = extract_features(log_dict)
+        net_scaled = scaler_net.transform(net.reshape(1, -1))
+        user_scaled = scaler_user.transform(user.reshape(1, -1))
+        
+        if pca is not None:
+            net_enc = pca.transform(net_scaled)
+        else:
+            net_enc = net_scaled
+        
+        x = np.hstack([net_enc, user_scaled])
+        prob = model.predict_proba(x)[:, 1]
+        score = float(prob[0])
+        pred = int(score > 0.5)
+        
+        # Debug logging
+        print(f"🔍 Score: {score:.4f}, Pred: {pred}, User: {log_dict['user_id']}, SrcBytes: {log_dict['src_bytes']:.0f}, DstBytes: {log_dict['dst_bytes']:.0f}")
+        
+        # Compute SHAP-like feature importance
+        importances = model.feature_importances_
+        contrib = x.flatten() * importances[:x.shape[1]]
+        top_idx = np.argsort(-np.abs(contrib))[:5]
+        
+        # Map indices back to feature names
+        feature_names = [
+            "duration", "src_bytes", "dst_bytes", "wrong_fragment", "urgent",
+            "count_same_dst", "srv_count", "proto_0", "proto_1", "proto_2",
+            "svc_0", "svc_1", "svc_2", "svc_3", "svc_4", "svc_5", "svc_6", "svc_7", "svc_8", "svc_9",
+            "flag_0", "flag_1", "flag_2", "flag_3", "flag_4", "flag_5",
+        ]
+        if pca is not None:
+            # PCA dims, name them as pca_0, pca_1, ...
+            feature_names = [f"pca_{i}" for i in range(net_enc.shape[1])]
+        
+        feature_names += ["login_hour", "avg_login_hour", "device_count", "new_device_flag", "sensitive_access"]
+        
+        top_features = []
+        for i in top_idx:
+            if i < len(feature_names):
+                top_features.append({
+                    "feature": feature_names[i],
+                    "value": float(x.flatten()[i]),
+                    "importance": float(importances[i]),
+                    "contribution": float(contrib[i]),
+                })
+        
+        severity = "Critical" if score > 0.7 else "Warning" if score > 0.4 else "Normal"
+        
+        # User behavior flags
+        user_behavior = []
+        if log_dict["new_device_flag"] == 1:
+            user_behavior.append("New device detected")
+        if log_dict["sensitive_access"] == 1:
+            user_behavior.append("Sensitive resource accessed")
+        if abs(log_dict["login_hour"] - log_dict["avg_login_hour"]) > 6:
+            user_behavior.append(f"Off-hours login (typical: {log_dict['avg_login_hour']:.1f}h)")
+        
+        return {
+            "score": score,
+            "alert": bool(pred),
+            "severity": severity,
+            "top_features": top_features,
+            "user_behavior": user_behavior,
+        }
+    except Exception as e:
+        print(f"Scoring failed: {e}")
+        return None
+
+
+async def log_tailer(interval: float = 0.5):
+    """Async generator that tails network.log, parses, scores, and yields SSE events.
+    
+    Reads new lines from LOG_FILE every `interval` seconds and emits structured events
+    containing raw log, parsed fields, severity, score, top features, and user behavior.
+    """
+    if not os.path.exists(LOG_FILE):
+        print(f"Log file {LOG_FILE} not found; creating empty file.")
+        open(LOG_FILE, 'a').close()
+    
+    try:
+        with open(LOG_FILE, 'r') as f:
+            # Seek to end to start tailing new lines
+            f.seek(0, 2)
+            while True:
+                line = f.readline()
+                if line:
+                    parsed = parse_log_line(line)
+                    if parsed:
+                        prediction = score_log_with_explainability(parsed)
+                        
+                        event = {
+                            "timestamp": parsed["timestamp"],
+                            "raw_log": line.strip(),
+                            "user_id": parsed["user_id"],
+                            "src_ip": parsed["src_ip"],
+                            "dst_ip": parsed["dst_ip"],
+                            "event": f"{parsed['user_id']} activity",
+                            "severity": "Normal",
+                            "score": None,
+                            "top_features": [],
+                            "user_behavior": [],
+                        }
+                        
+                        if prediction:
+                            event["severity"] = prediction["severity"]
+                            event["score"] = prediction["score"]
+                            event["top_features"] = prediction["top_features"]
+                            event["user_behavior"] = prediction["user_behavior"]
+                            if prediction["severity"] != "Normal":
+                                event["event"] = f"Anomaly detected: {parsed['user_id']}"
+                        
+                        _push_event(event)
+                        yield f"data: {json.dumps(event)}\n\n"
+                else:
+                    await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        return
+
+
+@app.get("/stream")
+async def stream(interval: float = 0.5):
+    """SSE endpoint that streams live logs from network.log with real-time predictions.
+
+    Query params:
+    - interval: float seconds between log polling (default 0.5)
+    """
+    headers = {"Cache-Control": "no-cache", "Content-Type": "text/event-stream"}
+    return StreamingResponse(log_tailer(interval=interval), headers=headers)
+
+
+@app.get("/logs")
+def get_logs(limit: int = 50):
+    """Return recent events from the in-memory buffer. """
+    return {"count": len(RECENT_EVENTS), "events": RECENT_EVENTS[:limit]}

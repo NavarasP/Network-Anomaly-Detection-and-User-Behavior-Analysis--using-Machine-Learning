@@ -5,15 +5,17 @@ const styles = {
   header: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 },
   title: { fontSize: 22, fontWeight: 700 },
   caption: { color: '#6b7280' },
-  alert: (color) => ({ background: color, color: 'white', padding: 12, borderRadius: 10, fontWeight: 600, textAlign: 'center', boxShadow: `0 0 15px ${color}77` }),
+  alert: (color) => ({ background: color, color: 'white', padding: 12, borderRadius: 10, fontWeight: 600, textAlign: 'center', boxShadow: `0 0 15px ${color}77`, marginBottom: 8 }),
   cards: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginTop: 12 },
   card: { background: 'white', padding: 12, borderRadius: 10, boxShadow: '0 2px 8px rgba(15,23,42,0.06)' },
   chart: { background: 'white', padding: 12, borderRadius: 10, marginTop: 12, height: 140, boxShadow: '0 2px 8px rgba(15,23,42,0.06)' },
   table: { marginTop: 12, borderRadius: 10, overflow: 'hidden', boxShadow: '0 2px 8px rgba(15,23,42,0.06)' },
   tableInner: { width: '100%', borderCollapse: 'collapse' },
-  th: { textAlign: 'left', padding: '8px 12px', background: '#f1f5f9', color: '#0f172a' },
-  td: { padding: '8px 12px', background: 'white', color: '#0f172a' },
-  smallMuted: { color: '#6b7280', fontSize: 13 }
+  th: { textAlign: 'left', padding: '8px 12px', background: '#f1f5f9', color: '#0f172a', fontSize: 13 },
+  td: { padding: '8px 12px', background: 'white', color: '#0f172a', fontSize: 13, borderBottom: '1px solid #f1f5f9' },
+  smallMuted: { color: '#6b7280', fontSize: 13 },
+  explainBox: { background: '#f0f9ff', padding: 10, borderRadius: 8, marginTop: 8, fontSize: 12 },
+  badge: { display: 'inline-block', padding: '2px 8px', borderRadius: 6, fontSize: 11, marginRight: 4, marginBottom: 4, background: '#fef3c7', color: '#92400e' }
 }
 
 function genEvent() {
@@ -34,9 +36,10 @@ export default function Home() {
   // IMPORTANT: Start with deterministic state for SSR to avoid hydration mismatches
   // Populate logs on client after mount (via /logs or SSE). Do not generate random events on SSR.
   const [logs, setLogs] = useState([])
-  const [alert, setAlert] = useState(null)
+  const [alerts, setAlerts] = useState([])
   const [loading, setLoading] = useState(false)
-  const [score, setScore] = useState(null)
+  const [analyzing, setAnalyzing] = useState(false)
+  const [selectedLog, setSelectedLog] = useState(null)
   
   // Load recent history from backend once on mount
   useEffect(() => {
@@ -47,7 +50,8 @@ export default function Home() {
         const json = await res.json()
         if (mounted && Array.isArray(json.events)) {
           setLogs(json.events.slice(0,40))
-          if (json.events.length && json.events[0].severity !== 'Normal') setAlert(json.events[0])
+          const newAlerts = json.events.filter(e => e.severity !== 'Normal').slice(0, 10)
+          setAlerts(newAlerts)
         }
       } catch (err) {
         console.warn('Failed to load logs', err)
@@ -81,9 +85,15 @@ export default function Home() {
       es.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data)
-          const mapped = { timestamp: data.timestamp, event: data.event, ip: data.ip, severity: data.severity }
-          setLogs((s) => [mapped, ...s].slice(0, 40))
-          if (mapped.severity !== 'Normal') setAlert(mapped)
+          // Show analyzing state briefly
+          setAnalyzing(true)
+          setTimeout(() => setAnalyzing(false), 800)
+          
+          setLogs((s) => [data, ...s].slice(0, 50))
+          
+          if (data.severity !== 'Normal') {
+            setAlerts((s) => [data, ...s].slice(0, 10))
+          }
         } catch (err) {
           console.error('Failed to parse SSE event', err)
         }
@@ -112,22 +122,6 @@ export default function Home() {
     }
   }, [])
 
-  async function pushEvent() {
-    const e = genEvent()
-    setLogs((s) => [e, ...s].slice(0, 40))
-    if (e.severity !== 'Normal') setAlert(e)
-    // Call backend for a score (sample payload length matches trained model expectations approx)
-    setLoading(true)
-    try {
-      const payload = { network: Array(16).fill(0).map(() => Math.random()), user: Array(4).fill(0).map(() => Math.random()) }
-      const res = await fetch('http://localhost:8000/score', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-      const json = await res.json()
-      setScore(json.score ?? json)
-    } catch (err) {
-      setScore({ error: err.message })
-    } finally { setLoading(false) }
-  }
-
   const counts = logs.reduce((acc, l) => { acc[l.severity] = (acc[l.severity]||0)+1; return acc }, {})
 
   return (
@@ -135,23 +129,29 @@ export default function Home() {
       <div style={styles.header}>
         <div>
           <div style={styles.title}>🛰️ Real-Time Network Anomaly & User Behavior Dashboard</div>
-          <div style={styles.caption}>Live monitoring with AI-based anomaly alerts</div>
+          <div style={styles.caption}>Live log monitoring with AI-based anomaly detection & explainability</div>
         </div>
         <div>
-          <button onClick={pushEvent} style={{ padding: '8px 12px', background: '#0ea5e9', color: 'white', border: 'none', borderRadius: 8 }}>Generate Event</button>
+          {analyzing && <span style={{ color: '#0ea5e9', fontWeight: 600, marginRight: 12 }}>⚙️ Analyzing...</span>}
         </div>
       </div>
 
-      {alert ? (
+      {/* Alert Banner */}
+      {alerts.length > 0 && (
         <div style={{ marginBottom: 12 }}>
-          <div style={styles.alert(alert.severity === 'Critical' ? '#dc2626' : '#f59e0b')}>{`🚨 ${alert.event} from ${alert.ip} at ${alert.timestamp}`}</div>
+          {alerts.slice(0,3).map((a, i) => (
+            <div key={i} style={styles.alert(a.severity === 'Critical' ? '#dc2626' : '#f59e0b')}>
+              🚨 {a.event} from {a.src_ip} at {a.timestamp} | Score: {a.score ? a.score.toFixed(3) : 'N/A'}
+            </div>
+          ))}
         </div>
-      ) : null}
+      )}
 
       <div style={{ display: 'flex', gap: 12 }}>
+        {/* Left: Logs Table + Chart */}
         <div style={{ flex: 1 }}>
           <div style={styles.chart}>
-            <div style={{ fontWeight: 600, marginBottom: 8 }}>Event Severity</div>
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Event Severity Distribution</div>
             <div style={{ display: 'flex', gap: 8, alignItems: 'end', height: 80 }}>
               {['Critical','Warning','Normal'].map((k)=> (
                 <div key={k} style={{ flex: 1 }}>
@@ -167,18 +167,22 @@ export default function Home() {
               <thead>
                 <tr>
                   <th style={styles.th}>Timestamp</th>
-                  <th style={styles.th}>Event</th>
-                  <th style={styles.th}>Source IP</th>
+                  <th style={styles.th}>User</th>
+                  <th style={styles.th}>Raw Log</th>
+                  <th style={styles.th}>Score</th>
                   <th style={styles.th}>Severity</th>
+                  <th style={styles.th}></th>
                 </tr>
               </thead>
               <tbody>
                 {logs.map((l, idx) => (
-                  <tr key={idx}>
+                  <tr key={idx} style={{ cursor: 'pointer' }} onClick={() => setSelectedLog(l)}>
                     <td style={styles.td}>{l.timestamp}</td>
-                    <td style={styles.td}>{l.event}</td>
-                    <td style={styles.td}>{l.ip}</td>
+                    <td style={styles.td}>{l.user_id || 'N/A'}</td>
+                    <td style={{...styles.td, maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{l.raw_log || l.event}</td>
+                    <td style={styles.td}>{l.score !== null && l.score !== undefined ? l.score.toFixed(3) : '—'}</td>
                     <td style={{...styles.td, fontWeight:600, color: l.severity==='Critical'?'#dc2626': l.severity==='Warning'?'#b45309':'#065f46' }}>{l.severity}</td>
+                    <td style={styles.td}>{selectedLog === l ? '👁️' : ''}</td>
                   </tr>
                 ))}
               </tbody>
@@ -186,7 +190,8 @@ export default function Home() {
           </div>
         </div>
 
-        <div style={{ width: 320 }}>
+        {/* Right: Stats + Explainability */}
+        <div style={{ width: 380 }}>
           <div style={styles.cards}>
             <div style={styles.card}><div style={{ fontSize: 12, color: '#6b7280' }}>Total Logs</div><div style={{ fontSize: 20, fontWeight: 700 }}>{logs.length}</div></div>
             <div style={styles.card}><div style={{ fontSize: 12, color: '#6b7280' }}>Normal</div><div style={{ fontSize: 20, fontWeight: 700 }}>{counts['Normal']||0}</div></div>
@@ -194,10 +199,44 @@ export default function Home() {
             <div style={styles.card}><div style={{ fontSize: 12, color: '#6b7280' }}>Critical</div><div style={{ fontSize: 20, fontWeight: 700 }}>{counts['Critical']||0}</div></div>
           </div>
 
+          {/* Explainability Panel */}
+          {selectedLog && (
+            <div style={{ marginTop: 12, ...styles.card }}>
+              <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 8 }}>🔍 Log Details</div>
+              <div style={styles.smallMuted}>Selected: {selectedLog.timestamp}</div>
+              <div style={{ fontSize: 13, marginTop: 6 }}>
+                <strong>User:</strong> {selectedLog.user_id || 'N/A'} | <strong>Score:</strong> {selectedLog.score !== null && selectedLog.score !== undefined ? selectedLog.score.toFixed(3) : 'N/A'}
+              </div>
+              <div style={{ fontSize: 12, marginTop: 4, color: '#475569' }}>{selectedLog.raw_log || selectedLog.event}</div>
+
+              {selectedLog.user_behavior && selectedLog.user_behavior.length > 0 && (
+                <div style={styles.explainBox}>
+                  <div style={{ fontWeight: 600, marginBottom: 4 }}>👤 User Behavior Flags:</div>
+                  {selectedLog.user_behavior.map((ub, i) => (
+                    <div key={i} style={styles.badge} className="badge-warning">{ub}</div>
+                  ))}
+                </div>
+              )}
+
+              {selectedLog.top_features && selectedLog.top_features.length > 0 && (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>📊 Top Contributing Features:</div>
+                  {selectedLog.top_features.map((f, i) => (
+                    <div key={i} style={{ fontSize: 11, marginBottom: 2, color: '#475569' }}>
+                      <strong>{f.feature}:</strong> {f.value.toFixed(2)} (contrib: {f.contribution.toFixed(3)})
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           <div style={{ marginTop: 12, ...styles.card }}>
-            <div style={{ fontSize: 12, color: '#6b7280' }}>Last Score</div>
-            <div style={{ fontSize: 18, fontWeight: 700 }}>{loading ? 'Calling...' : (score === null ? '—' : (score.error ? 'Error' : Number(score).toFixed(3)))}</div>
-            <div style={styles.smallMuted}>Scores are produced by the backend model</div>
+            <div style={{ fontSize: 12, color: '#6b7280' }}>System Status</div>
+            <div style={{ fontSize: 16, fontWeight: 700, color: analyzing ? '#0ea5e9' : '#10b981' }}>
+              {analyzing ? 'Analyzing logs...' : 'Listening for logs'}
+            </div>
+            <div style={styles.smallMuted}>Backend streaming from network.log</div>
           </div>
         </div>
       </div>
