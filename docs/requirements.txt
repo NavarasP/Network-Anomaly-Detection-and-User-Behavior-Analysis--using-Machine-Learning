@@ -1,3 +1,17 @@
-streamlit==1.37.0
+streamlit==1.24.0
+
+# Core runtime deps to run examples alongside docs
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
+joblib==1.5.2
+scikit-learn>=1.0
+onnxruntime>=1.16
+
+# Data libraries
 pandas==2.2.3
 numpy==1.26.4
+
+# Optional: encoder conversion tools (used in backend/encoder_to_onnx.py)
+# tensorflow>=2.11
+# tf2onnx>=1.15
+# onnx>=1.14

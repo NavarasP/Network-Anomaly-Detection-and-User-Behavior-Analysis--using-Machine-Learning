@@ -4,3 +4,9 @@ joblib==1.5.2
 scikit-learn>=1.0
 numpy>=1.21
 pandas>=1.5
+onnxruntime>=1.16
+
+# Optional: only needed for encoder export (dev tools)
+# tensorflow>=2.11
+# tf2onnx>=1.15
+# onnx>=1.14
